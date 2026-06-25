@@ -1,0 +1,32 @@
+# Data files
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.envrc
+venv/
+env/
+.venv/
+
+# Model weights
+*.pth
+*.pt
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
