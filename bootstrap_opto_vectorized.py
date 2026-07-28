@@ -99,16 +99,16 @@ def decay_recovery_trajectory_model(t, y_min, tau_decay, A_rec, tau_rec):
 # ============================================================
 def _fit_replicate_precomputed(args):
     """
-    Worker for vectorized bootstrap: receives a pre-computed mean trace and runs
-    curve fitting + metric extraction. Analytical logic is identical to the original
-    fit_bootstrap_iteration; only the input signature changes (pre-built mean array
-    instead of raw traces dict).
+    Worker for vectorized bootstrap: receives a pre-computed per-replicate central
+    trace (MEDIAN across animals) and runs curve fitting + metric extraction.
+    Analytical logic is identical to the original fit_bootstrap_iteration; only the
+    input signature changes (pre-built central-trace array instead of raw traces dict).
     """
-    i, mean_trace, time_grid_arr = args
+    i, central_trace, time_grid_arr = args
     try:
         post_mask = time_grid_arr >= 0
         t = time_grid_arr[post_mask]
-        y = mean_trace[post_mask]
+        y = central_trace[post_mask]
 
         if len(t) < 6 or np.any(np.isnan(y)):
             return None
@@ -772,7 +772,13 @@ class AnalysisWorker(QThread):
                     traces[aid] = window.set_index("time_rel")["speed_norm"]
 
                 time_grid = sorted(set(np.concatenate([t.index.values for t in traces.values()])))
-                mean_trace = pd.DataFrame(traces).reindex(time_grid).mean(axis=1)
+                # Aggregate across animals with the MEDIAN, not the mean. Per-animal
+                # baseline normalization (speed/baseline) makes the ratio distribution
+                # heavy-tailed: low-baseline (dwelling) worms carry ~1/baseline weight
+                # and drag a mean-of-ratios well above the typical worm. The median is
+                # robust to that tail and tracks the raw trace. Named central_trace to
+                # reflect that it is no longer a mean.
+                central_trace = pd.DataFrame(traces).reindex(time_grid).median(axis=1)
 
                 # Export normalized traces in long format for visualization
                 trace_records = []
@@ -837,16 +843,20 @@ class AnalysisWorker(QThread):
                 # Draw all sample indices at once: shape (n_boot, n_animals)
                 sample_idx = np.random.randint(0, n_animals, size=(n_boot, n_animals))
 
-                # Compute all mean traces in bounded-memory chunks.
-                # animal_matrix[chunk_idx] → (chunk, n_animals, n_grid); mean over axis=1 → (chunk, n_grid)
+                # Compute all per-replicate central traces in bounded-memory chunks.
+                # animal_matrix[chunk_idx] → (chunk, n_animals, n_grid); MEDIAN over
+                # axis=1 → (chunk, n_grid). Median (not mean) across animals so each
+                # replicate reflects the typical worm rather than a 1/baseline-weighted
+                # average dominated by low-baseline dwellers. This is the fix that
+                # de-inflates A_rec / tau_rec; y_min / tau_decay are essentially unchanged.
                 CHUNK = 500
-                all_mean_traces = np.empty((n_boot, n_grid))
+                all_central_traces = np.empty((n_boot, n_grid))
                 for c_start in range(0, n_boot, CHUNK):
                     c_end = min(c_start + CHUNK, n_boot)
                     chunk_idx = sample_idx[c_start:c_end]
-                    all_mean_traces[c_start:c_end] = np.nanmean(animal_matrix[chunk_idx], axis=1)
+                    all_central_traces[c_start:c_end] = np.nanmedian(animal_matrix[chunk_idx], axis=1)
 
-                fit_args = [(i, all_mean_traces[i], time_grid_arr) for i in range(n_boot)]
+                fit_args = [(i, all_central_traces[i], time_grid_arr) for i in range(n_boot)]
                 with Pool(processes=self.params['n_cores']) as pool:
                     results = pool.map(_fit_replicate_precomputed, fit_args)
                 # ─────────────────────────────────────────────────────────────────
@@ -865,7 +875,7 @@ class AnalysisWorker(QThread):
                 boot_df.to_csv(f"{self.params['outdir']}/{gname_str}_bootstrap_params.csv", index=False)
 
                 # Normalized + fit plot
-                post_times = mean_trace.index[mean_trace.index >= 0]
+                post_times = central_trace.index[central_trace.index >= 0]
 
                 if len(boot_df) > 0:
                     med = boot_df.median(numeric_only=True)
@@ -886,7 +896,7 @@ class AnalysisWorker(QThread):
                 for aid in animals:
                     plt.plot(traces[aid].index, traces[aid].values, alpha=0.1, color="steelblue")
 
-                plt.plot(mean_trace.index, mean_trace.values, color="black", lw=2.5, label="Mean data", zorder=5)
+                plt.plot(central_trace.index, central_trace.values, color="black", lw=2.5, label="Median data (across animals)", zorder=5)
                 plt.plot(post_times, fit_curve, color="red", lw=2.5, ls="-", label="Trajectory fit", zorder=6)
                 plt.plot(post_times, fit_decay, color="orange", lw=1.5, ls=":", label="Decay component", alpha=0.7)
                 plt.plot(post_times, fit_recovery, color="green", lw=1.5, ls=":", label="Recovery trajectory", alpha=0.7)
@@ -897,7 +907,7 @@ class AnalysisWorker(QThread):
                 plt.ylabel("Normalized speed", fontsize=12)
                 plt.title(f"NORMALIZED + FIT: {gname_str}", fontsize=14, fontweight='bold')
                 plt.legend(fontsize=9, loc='upper left')
-                plt.ylim(0, max(2.0, mean_trace.max() * 1.1))
+                plt.ylim(0, max(2.0, central_trace.max() * 1.1))
                 plt.grid(alpha=0.3)
 
                 # Add equation text box with fitted parameters

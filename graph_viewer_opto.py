@@ -13,6 +13,7 @@ Ported Richards v5 UI patterns:
 """
 
 import sys
+import warnings
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -98,11 +99,29 @@ def decay_recovery_trajectory_model(t, y_min, tau_decay, A_rec, tau_rec):
 
 
 def compute_trace_stats(df: pd.DataFrame,
-                        smooth_sigma: float = 0.0) -> Dict[Tuple, Tuple]:
+                        smooth_sigma: float = 0.0,
+                        n_boot: int = 1000,
+                        seed: int = 0) -> Dict[Tuple, Tuple]:
     """
-    Pre-compute (t, mu, lo, hi) for every (sex, genotype, treatment) group.
-    Uses speed_norm column (normalized traces from bootstrap script).
-    smooth_sigma > 0 applies Gaussian smoothing to mu/lo/hi (reduces jaggedness).
+    Pre-compute (t, med, ci_lo, ci_hi, iqr_lo, iqr_hi) for every
+    (sex, genotype, treatment) group. Uses the speed_norm column (per-animal
+    baseline-normalized traces from the bootstrap script).
+
+    Central line is the MEDIAN across animals at each timepoint, not the mean.
+    Per-animal normalization (speed/baseline) yields a heavy-tailed ratio: a
+    dwelling worm with a near-zero baseline reads as many multiples of baseline
+    for the whole tail, and a mean-of-ratios weights each worm by ~1/baseline,
+    inflating the group trace above the typical animal. The median is robust to
+    that tail and matches the raw trace.
+
+    Two bands are pre-computed so the UI toggle can switch instantly:
+      • ci_lo/ci_hi : nonparametric bootstrap 95% CI OF THE MEDIAN (uncertainty
+                      of the central estimate — the honest analogue of the old SEM
+                      band, but robust). Default.
+      • iqr_lo/iqr_hi : 25th–75th percentile across animals (spread of the
+                        population, not precision of the estimate).
+
+    smooth_sigma > 0 applies Gaussian smoothing to every returned series.
     Rebuilt only at load time — reads from cache on every redraw.
     """
     cache = {}
@@ -118,6 +137,9 @@ def compute_trace_stats(df: pd.DataFrame,
     if not group_cols:
         return cache
 
+    has_animal = "animal_id" in work.columns
+    rng = np.random.default_rng(seed)
+
     for keys, sub in work.groupby(group_cols):
         if len(group_cols) == 3:
             sex, gen, trt = (str(k) for k in keys)
@@ -125,16 +147,55 @@ def compute_trace_stats(df: pd.DataFrame,
             # fallback if some columns missing
             sex, gen, trt = str(keys), "", ""
 
-        agg = sub.groupby("time_rel")["speed_norm"].agg(["mean", "sem"]).sort_index()
-        t   = agg.index.values
-        mu  = agg["mean"].values
-        lo  = mu - np.nan_to_num(agg["sem"].values)
-        hi  = mu + np.nan_to_num(agg["sem"].values)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+
+            if has_animal:
+                # Wide matrix: rows = timepoints, cols = animals (NaN where an
+                # animal has no sample at that time). Duplicate (t, animal) rows
+                # are averaged within-animal first so one worm counts once per t.
+                piv = sub.pivot_table(index="time_rel", columns="animal_id",
+                                      values="speed_norm", aggfunc="mean").sort_index()
+                t = piv.index.values
+                M = piv.values                                  # (n_t, n_animals)
+                n_animals = M.shape[1]
+
+                med    = np.nanmedian(M, axis=1)
+                iqr_lo = np.nanpercentile(M, 25, axis=1)
+                iqr_hi = np.nanpercentile(M, 75, axis=1)
+
+                if n_animals >= 3 and n_boot and n_boot > 0:
+                    # Bootstrap the median across animals, per timepoint.
+                    # idx: (n_boot, n_animals) -> M[:, idx]: (n_t, n_boot, n_animals)
+                    idx   = rng.integers(0, n_animals, size=(n_boot, n_animals))
+                    boot  = np.nanmedian(M[:, idx], axis=2)      # (n_t, n_boot)
+                    ci_lo = np.nanpercentile(boot, 2.5,  axis=1)
+                    ci_hi = np.nanpercentile(boot, 97.5, axis=1)
+                else:
+                    ci_lo, ci_hi = med.copy(), med.copy()
+            else:
+                # No animal_id (older CSVs): pool all rows per timepoint. Median
+                # and IQR are still well-defined; CI-of-median is not available
+                # without animal identity, so it collapses to the median line.
+                agg = sub.groupby("time_rel")["speed_norm"].agg(
+                    med=lambda s: np.nanmedian(s),
+                    q25=lambda s: np.nanpercentile(s, 25),
+                    q75=lambda s: np.nanpercentile(s, 75),
+                ).sort_index()
+                t      = agg.index.values
+                med    = agg["med"].values
+                iqr_lo = agg["q25"].values
+                iqr_hi = agg["q75"].values
+                ci_lo, ci_hi = med.copy(), med.copy()
+
         if smooth_sigma > 0:
-            mu = gaussian_filter1d(mu, sigma=smooth_sigma)
-            lo = gaussian_filter1d(lo, sigma=smooth_sigma)
-            hi = gaussian_filter1d(hi, sigma=smooth_sigma)
-        cache[(sex, gen, trt)] = (t, mu, lo, hi)
+            med    = gaussian_filter1d(med,    sigma=smooth_sigma)
+            ci_lo  = gaussian_filter1d(ci_lo,  sigma=smooth_sigma)
+            ci_hi  = gaussian_filter1d(ci_hi,  sigma=smooth_sigma)
+            iqr_lo = gaussian_filter1d(iqr_lo, sigma=smooth_sigma)
+            iqr_hi = gaussian_filter1d(iqr_hi, sigma=smooth_sigma)
+
+        cache[(sex, gen, trt)] = (t, med, ci_lo, ci_hi, iqr_lo, iqr_hi)
 
     return cache
 
@@ -329,6 +390,62 @@ PARAMETERS = {
     'recovery_completeness':  ('Recovery Completeness',             'fraction (0-1)'),
 }
 
+# Metrics offered on the 2D phenotype-space axes (ordered), and which of them are
+# recovery TIMES (subject to censoring when a group never recovers).
+PHENO_METRIC_KEYS = [
+    'drop_depth', 'y_min_actual', 'recovery_completeness',
+    't_half_recovery_actual', 't_at_min', 'trough_width_75',
+]
+_TIME_YKEYS = {'t_half_recovery_actual'}
+
+
+def _pheno_err(m, lo, hi):
+    """Asymmetric error-bar arg for matplotlib, or None if CIs missing."""
+    if np.isfinite(lo) and np.isfinite(hi):
+        return [[max(m - lo, 0.0)], [max(hi - m, 0.0)]]
+    return None
+
+
+def draw_phenotype_scatter(ax, points, x_label, y_label,
+                           censor_edge=None, show_labels=True):
+    """
+    Draw one point per group with 2D (x and y) 95% CI whiskers. `points` is a
+    list of dicts: x, xlo, xhi, y, ylo, yhi, color, label, censored, rec_frac.
+    Censored points (recovery-time y-axis, group didn't recover) are drawn at
+    `censor_edge` with an up-arrow instead of a fabricated value. Returns the
+    list of censored group labels.
+    """
+    censored = []
+    for p in points:
+        if not np.isfinite(p["x"]):
+            continue
+        c = p["color"]
+        if p.get("censored"):
+            ax.errorbar(p["x"], censor_edge, xerr=_pheno_err(p["x"], p["xlo"], p["xhi"]),
+                        fmt="o", color=c, markersize=9, markerfacecolor="white",
+                        markeredgecolor=c, markeredgewidth=2, capsize=3, zorder=5)
+            ax.annotate("", xy=(p["x"], censor_edge * 1.06), xytext=(p["x"], censor_edge),
+                        arrowprops=dict(arrowstyle="-|>", color=c, lw=2))
+            if show_labels:
+                rf = p.get("rec_frac", np.nan)
+                extra = f"  (≥edge; {rf:.0%} rec.)" if np.isfinite(rf) else "  (≥edge)"
+                ax.annotate(p["label"] + extra, (p["x"], censor_edge),
+                            textcoords="offset points", xytext=(8, 4), fontsize=8, color=c)
+            censored.append(p["label"])
+        else:
+            ax.errorbar(p["x"], p["y"],
+                        xerr=_pheno_err(p["x"], p["xlo"], p["xhi"]),
+                        yerr=_pheno_err(p["y"], p["ylo"], p["yhi"]),
+                        fmt="o", color=c, markersize=9, capsize=3,
+                        elinewidth=1.5, zorder=5)
+            if show_labels:
+                ax.annotate(p["label"], (p["x"], p["y"]),
+                            textcoords="offset points", xytext=(8, 4), fontsize=8, color=c)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.grid(True, alpha=0.25)
+    return censored
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main application
@@ -342,7 +459,7 @@ class ParameterViewer:
         self.root.title("Parameter Graph Viewer v3")
 
         # Per-tab Y-axis state — (auto:bool, ymin:str, ymax:str)
-        self._tab_ylim_state = [(True, "0", "1.2"), (True, "0", "1.2")]
+        self._tab_ylim_state = [(True, "0", "1.2"), (True, "0", "1.2"), (True, "0", "1.2")]
         self._active_tab_idx = 0
         self.root.geometry("1400x900")
 
@@ -363,8 +480,13 @@ class ParameterViewer:
         self.show_legend    = tk.BooleanVar(value=True)
         self.show_overlay   = tk.BooleanVar(value=False)
         self.show_points    = tk.BooleanVar(value=False)
-        self.show_ci_sem    = tk.BooleanVar(value=False)   # False = 95% CI, True = SEM
+        self.show_iqr       = tk.BooleanVar(value=False)   # False = 95% CI of median, True = IQR spread
         self.smooth_sigma   = tk.StringVar(value="0")
+        # ── Phenotype (2D) tab vars ──
+        self.pheno_x_var    = tk.StringVar(value=PARAMETERS['drop_depth'][0])
+        self.pheno_y_var    = tk.StringVar(value=PARAMETERS['trough_width_75'][0])
+        self.pheno_xauto    = tk.BooleanVar(value=True)
+        self.pheno_yauto    = tk.BooleanVar(value=True)
 
         # Per-tab titles, font sizes, tick spacing
         self.tab_titles    = [tk.StringVar() for _ in range(2)]
@@ -467,6 +589,40 @@ class ParameterViewer:
 
         ttk.Separator(p, orient="horizontal").pack(fill=tk.X, pady=6)
 
+        # 2D Phenotype space (only affects the Phenotype Space tab)
+        pf2 = ttk.LabelFrame(p, text="2D Phenotype Space", padding=4)
+        pf2.pack(fill=tk.X, pady=(0, 4))
+        _pheno_choices = [PARAMETERS[k][0] for k in PHENO_METRIC_KEYS if k in PARAMETERS]
+        ttk.Label(pf2, text="X metric").pack(anchor="w")
+        ttk.Combobox(pf2, textvariable=self.pheno_x_var, values=_pheno_choices,
+                     state="readonly").pack(fill=tk.X)
+        ttk.Label(pf2, text="Y metric").pack(anchor="w")
+        ttk.Combobox(pf2, textvariable=self.pheno_y_var, values=_pheno_choices,
+                     state="readonly").pack(fill=tk.X)
+        self.pheno_x_var.trace_add("write", lambda *_: self.refresh())
+        self.pheno_y_var.trace_add("write", lambda *_: self.refresh())
+
+        ttk.Checkbutton(pf2, text="Auto X-range", variable=self.pheno_xauto,
+                        command=self.refresh).pack(anchor="w", pady=(4, 0))
+        rowx = ttk.Frame(pf2); rowx.pack(fill=tk.X)
+        ttk.Label(rowx, text="X min").pack(side=tk.LEFT)
+        self.pheno_xmin_e = ttk.Entry(rowx, width=6); self.pheno_xmin_e.pack(side=tk.LEFT, padx=2)
+        ttk.Label(rowx, text="max").pack(side=tk.LEFT)
+        self.pheno_xmax_e = ttk.Entry(rowx, width=6); self.pheno_xmax_e.pack(side=tk.LEFT, padx=2)
+
+        ttk.Checkbutton(pf2, text="Auto Y-range", variable=self.pheno_yauto,
+                        command=self.refresh).pack(anchor="w", pady=(4, 0))
+        rowy = ttk.Frame(pf2); rowy.pack(fill=tk.X)
+        ttk.Label(rowy, text="Y min").pack(side=tk.LEFT)
+        self.pheno_ymin_e = ttk.Entry(rowy, width=6); self.pheno_ymin_e.pack(side=tk.LEFT, padx=2)
+        ttk.Label(rowy, text="max").pack(side=tk.LEFT)
+        self.pheno_ymax_e = ttk.Entry(rowy, width=6); self.pheno_ymax_e.pack(side=tk.LEFT, padx=2)
+        for w in (self.pheno_xmin_e, self.pheno_xmax_e, self.pheno_ymin_e, self.pheno_ymax_e):
+            w.bind("<KeyRelease>", lambda _: self.refresh())
+            w.bind("<FocusOut>",   lambda _: self.refresh())
+
+        ttk.Separator(p, orient="horizontal").pack(fill=tk.X, pady=6)
+
         ttk.Button(p, text="Export figure  (PNG / SVG / PDF)",
                    command=self._export_figure).pack(fill=tk.X, pady=(0, 10))
 
@@ -476,8 +632,10 @@ class ParameterViewer:
 
         self.tab_params = ttk.Frame(self.nb)
         self.tab_traces = ttk.Frame(self.nb)
+        self.tab_pheno  = ttk.Frame(self.nb)
         self.nb.add(self.tab_params, text="Parameter Distributions")
         self.nb.add(self.tab_traces, text="Speed Traces")
+        self.nb.add(self.tab_pheno,  text="Phenotype Space")
         self.nb.bind("<<NotebookTabChanged>>", lambda _: self._on_tab_change())
 
         VIOLIN_MARGINS = dict(left=0.15, right=0.97, top=0.93, bottom=0.32)
@@ -530,9 +688,13 @@ class ParameterViewer:
             self.tab_params, VIOLIN_MARGINS)
         self.fig_traces, self.ax_traces, self.canvas_traces = _make_tab(
             self.tab_traces, TRACE_MARGINS)
+        PHENO_MARGINS = dict(left=0.13, right=0.97, top=0.93, bottom=0.12)
+        self.fig_pheno, self.ax_pheno, self.canvas_pheno = _make_tab(
+            self.tab_pheno, PHENO_MARGINS)
 
         for ax, msg in [(self.ax_params, "Load data to begin"),
-                        (self.ax_traces, "Load trace data to begin")]:
+                        (self.ax_traces, "Load trace data to begin"),
+                        (self.ax_pheno,  "Load data to begin")]:
             ax.text(0.5, 0.5, msg, ha='center', va='center',
                     fontsize=16, color='gray', transform=ax.transAxes)
 
@@ -627,8 +789,8 @@ class ParameterViewer:
 
         ttk.Checkbutton(pf, text="Show individual points (10% sample)",
                         variable=self.show_points, command=self.refresh).pack(anchor="w", pady=(4, 0))
-        ttk.Checkbutton(pf, text="Show SEM instead of 95% CI",
-                        variable=self.show_ci_sem, command=self.refresh).pack(anchor="w")
+        ttk.Checkbutton(pf, text="Show IQR (population spread) instead of 95% CI of median",
+                        variable=self.show_iqr, command=self.refresh).pack(anchor="w")
         row = ttk.Frame(p); row.pack(fill=tk.X, pady=(4,0))
         ttk.Label(row, text="Ribbon smoothing σ:", font=("",8)).pack(side=tk.LEFT)
         sm_e = ttk.Entry(row, textvariable=self.smooth_sigma, width=5)
@@ -694,7 +856,7 @@ class ParameterViewer:
         ttk.Label(tf, text="(blank/0 = auto)", font=("", 7),
                   foreground="gray").grid(row=0, column=4, sticky="w", padx=4)
 
-        for i, tab_name in enumerate(self._TAB_NAMES):
+        for i, tab_name in enumerate(self._TAB_NAMES[:2]):
             r = i + 1
             ttk.Label(tf, text=tab_name, font=("", 8), foreground="gray",
                       width=16).grid(row=r, column=0, sticky="w", pady=2)
@@ -1096,11 +1258,11 @@ class ParameterViewer:
     # ─────────────────────────────────────────────────────────────────────────
     # Figure size controls
     # ─────────────────────────────────────────────────────────────────────────
-    _TAB_NAMES = ["Parameter Distributions", "Speed Traces"]
+    _TAB_NAMES = ["Parameter Distributions", "Speed Traces", "Phenotype Space"]
 
     def _active_fig(self):
         idx = self.nb.index(self.nb.select())
-        return (self.fig_params, self.fig_traces)[idx]
+        return (self.fig_params, self.fig_traces, self.fig_pheno)[idx]
 
     def _on_tab_change(self):
         self._save_ylim_state()
@@ -1174,7 +1336,7 @@ class ParameterViewer:
         w = safe_float(self.fig_w.get(), 10.0)
         h_raw = safe_float(self.fig_h.get(), 6.0)
         if w > 0:
-            for fig in (self.fig_params, self.fig_traces):
+            for fig in (self.fig_params, self.fig_traces, self.fig_pheno):
                 h = self._resolve_h(fig, w, h_raw)
                 self._resize_fig(fig, w, h)
             h_active = self._resolve_h(self._active_fig(), w, h_raw)
@@ -1263,10 +1425,11 @@ class ParameterViewer:
             entry = self._trace_cache.get(gc.key)
             if entry is None:
                 continue
-            t, mu, lo, hi = entry
+            t, med, ci_lo, ci_hi, iqr_lo, iqr_hi = entry
+            lo, hi = (iqr_lo, iqr_hi) if self.show_iqr.get() else (ci_lo, ci_hi)
             ax.fill_between(t, lo, hi, color=gc.color, alpha=SEM_ALPHA,
                             linewidth=0.6, edgecolor=gc.color, antialiased=True)
-            ax.plot(t, mu, color=gc.color, linewidth=2.0, label=gc.label)
+            ax.plot(t, med, color=gc.color, linewidth=2.0, label=gc.label)
             plotted.append(gc)
 
         # Fit curve overlay from median bootstrap parameters
@@ -1295,11 +1458,97 @@ class ParameterViewer:
         ax.axvline(0, color="#444444", linestyle=":", linewidth=1.2, alpha=0.6)
         ax.set_xlabel("Time relative to stimulus (s)")
         ax.set_ylabel("Normalized Speed")
-        ax.set_title(self._get_tab_title(1, "Normalized Speed Traces  (mean ± SEM)"))
+        _band = "IQR across animals" if self.show_iqr.get() else "95% CI of median"
+        ax.set_title(self._get_tab_title(1, f"Normalized Speed Traces  (median, {_band})"))
         self._apply_ylim(ax)
         self._apply_ticks(ax, 1)
         self._apply_display(ax, fig=self.fig_traces, has_legend=True)
         self.canvas_traces.draw_idle()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phenotype space (2D)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _pheno_key(self, pretty):
+        for k in PHENO_METRIC_KEYS:
+            if k in PARAMETERS and PARAMETERS[k][0] == pretty:
+                return k
+        return pretty  # fallback: treat the string as a raw column key
+
+    def _plot_phenotype(self):
+        ax = self.ax_pheno
+        ax.clear()
+        if self.bootstrap_data is None:
+            ax.text(0.5, 0.5, "Load data to begin", ha='center', va='center',
+                    fontsize=16, color='gray', transform=ax.transAxes)
+            self.canvas_pheno.draw(); return
+
+        df = self.bootstrap_data
+        xkey = self._pheno_key(self.pheno_x_var.get())
+        ykey = self._pheno_key(self.pheno_y_var.get())
+        missing = [k for k in (xkey, ykey) if k not in df.columns]
+        if missing:
+            ax.text(0.5, 0.5,
+                    "Metric(s) not in data:\n" + ", ".join(missing),
+                    ha='center', va='center', fontsize=12, color='gray',
+                    transform=ax.transAxes)
+            self.canvas_pheno.draw(); return
+
+        y_is_time = ykey in _TIME_YKEYS
+        points, edge_vals = [], []
+        for gc in self._visible_groups():
+            mask = ((df["sex"]       == gc.sex) &
+                    (df["genotype"]  == gc.genotype) &
+                    (df["treatment"] == gc.treatment))
+            sub = df[mask]
+            if sub.empty:
+                continue
+            xv = sub[xkey].dropna()
+            if len(xv) == 0:
+                continue
+            xm, xlo, xhi = float(xv.median()), float(xv.quantile(0.025)), float(xv.quantile(0.975))
+            yv = sub[ykey].dropna()
+            rec = float(sub["model_free_recovered"].mean()) if "model_free_recovered" in sub.columns else np.nan
+
+            cens = False
+            ym = ylo = yhi = np.nan
+            if y_is_time and (len(yv) == 0 or (np.isfinite(rec) and rec < 0.5)):
+                cens = True  # recovery-time axis + group didn't recover -> censor
+            elif len(yv) == 0:
+                continue
+            else:
+                ym, ylo, yhi = float(yv.median()), float(yv.quantile(0.025)), float(yv.quantile(0.975))
+                edge_vals.append(yhi if np.isfinite(yhi) else ym)
+
+            points.append(dict(x=xm, xlo=xlo, xhi=xhi, y=ym, ylo=ylo, yhi=yhi,
+                               color=gc.color, label=gc.label, censored=cens, rec_frac=rec))
+
+        if not points:
+            ax.text(0.5, 0.5, "No visible groups with data", ha='center', va='center',
+                    fontsize=14, color='gray', transform=ax.transAxes)
+            self.canvas_pheno.draw(); return
+
+        edge = (max(edge_vals) * 1.15) if edge_vals else 1.0
+        cens_labels = draw_phenotype_scatter(
+            ax, points, self.pheno_x_var.get(), self.pheno_y_var.get(),
+            censor_edge=edge, show_labels=self.show_legend.get())
+
+        # manual axis scaling (start/end numbers)
+        if not self.pheno_xauto.get():
+            lo = safe_float(self.pheno_xmin_e.get(), np.nan)
+            hi = safe_float(self.pheno_xmax_e.get(), np.nan)
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                ax.set_xlim(lo, hi)
+        if not self.pheno_yauto.get():
+            lo = safe_float(self.pheno_ymin_e.get(), np.nan)
+            hi = safe_float(self.pheno_ymax_e.get(), np.nan)
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                ax.set_ylim(lo, hi)
+
+        title = "Phenotype space"
+        if cens_labels:
+            title += "   (↑ censored: no recovery in-window)"
+        ax.set_title(title)
+        self.canvas_pheno.draw()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Refresh dispatcher
@@ -1311,13 +1560,13 @@ class ParameterViewer:
         try:
             idx = self.nb.index(self.nb.select())
             if hasattr(self, "fig_params"):
-                fig = (self.fig_params, self.fig_traces)[idx]
+                fig = (self.fig_params, self.fig_traces, self.fig_pheno)[idx]
                 w, h = fig.get_size_inches()
                 self.fig_w.delete(0, tk.END); self.fig_w.insert(0, f"{w:.1f}")
                 self.fig_h.delete(0, tk.END); self.fig_h.insert(0, f"{h:.1f}")
                 if hasattr(self, "fig_tab_lbl"):
                     self.fig_tab_lbl.config(text=self._TAB_NAMES[idx])
-            [self._plot_params, self._plot_traces][idx]()
+            [self._plot_params, self._plot_traces, self._plot_phenotype][idx]()
 
         finally:
             self._in_refresh = False
@@ -1326,7 +1575,7 @@ class ParameterViewer:
     # ─────────────────────────────────────────────────────────────────────────
     def _export_figure(self):
         idx  = self.nb.index(self.nb.select())
-        fig  = (self.fig_params, self.fig_traces)[idx]
+        fig  = (self.fig_params, self.fig_traces, self.fig_pheno)[idx]
         fp   = filedialog.asksaveasfilename(
                    defaultextension=".png",
                    filetypes=[("PNG", "*.png"), ("SVG", "*.svg"),
