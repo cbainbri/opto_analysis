@@ -6,7 +6,8 @@ Analysis pipeline for C. elegans optogenetics experiments. Takes merged tracking
 
 ```
 Raw tracking CSVs (from tracking_pipeline/batch_tracking_opto.py)
-  → merge_files.py        (wide → long format composite)
+  → tracking_pipeline/prep_track_data.py  (collect finished tracks as PC#_<folder>.csv)
+  → tracking_pipeline/merge_files.py      (wide → long format composite.csv)
   → bootstrap_opto.py     (decay-recovery fitting + bootstrap)
   → graph_viewer_opto.py  (visualize bootstrap results)
 ```
@@ -15,17 +16,8 @@ Raw tracking CSVs (from tracking_pipeline/batch_tracking_opto.py)
 
 ## Scripts
 
-### `merge_files.py`
-Tkinter GUI that converts wide-format opto tracking CSVs into a single long-format composite CSV. Supports manual metadata entry or automatic inference from standardized filenames (`PC1_5.28.2025_m_wt_3hr`).
-
-Handles opto-specific columns emitted by the opto tracker:
-- Shape metrics per worm: `major_axis`, `minor_axis`, `aspect_ratio`, `area`, `perimeter`, `convexity`, `solidity`
-- `stim` — optogenetic stimulus timing flag (marks when the light pulse fires)
-
-Also supports appending new assays to an existing composite.
-
-**Input:** directory of wide-format CSVs (output of `batch_tracking_opto.py`)
-**Output:** `composite.csv` (long format, one row per worm per frame)
+### Building `composite.csv`
+`merge_files.py` (and the `prep_track_data.py` step before it) now live in [tracking_pipeline](https://github.com/cbainbri/tracking_pipeline), shared with food encounter analysis. It keeps the opto-specific columns (shape metrics and `stim`) in the composite.
 
 ---
 
@@ -36,7 +28,7 @@ The model fits the observed trajectory without forcing an asymptotic plateau, us
 
 > **Note:** Uses PyQt5 rather than Tkinter to avoid conflicts between Tkinter's event loop and Python's multiprocessing module during parallel bootstrap fitting.
 
-**Input:** `composite.csv` from `merge_files.py`
+**Input:** `composite.csv` from `tracking_pipeline/merge_files.py`
 **Output:** bootstrap fit results and plots
 
 ---
